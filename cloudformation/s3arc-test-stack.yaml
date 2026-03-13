@@ -1,0 +1,334 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: S3Arc Test Environment - FSx ONTAP, EC2 client, S3 archive bucket
+
+Parameters:
+  ArchiveBucketName:
+    Type: String
+    Default: s3arc-test-archive
+    Description: Name for the S3 archive bucket
+  
+  FsxStorageCapacity:
+    Type: Number
+    Default: 1024
+    Description: FSx storage capacity in GB (minimum 1024)
+  
+  FsxThroughput:
+    Type: Number
+    Default: 512
+    Description: FSx throughput capacity in MB/s
+  
+  Ec2InstanceType:
+    Type: String
+    Default: c5n.9xlarge
+    Description: EC2 instance type (c5n.9xlarge = 50Gbps, c5n.18xlarge = 100Gbps)
+  
+  KeyPairName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: EC2 key pair for SSH access
+
+Resources:
+  # VPC and Networking
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: s3arc-test-vpc
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs us-east-1]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: s3arc-test-public
+
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.10.0/24
+      AvailabilityZone: !Select [0, !GetAZs us-east-1]
+      Tags:
+        - Key: Name
+          Value: s3arc-test-private-1
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.11.0/24
+      AvailabilityZone: !Select [1, !GetAZs us-east-1]
+      Tags:
+        - Key: Name
+          Value: s3arc-test-private-2
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  # Security Groups
+  Ec2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: EC2 client security group
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+
+  FsxSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: FSx ONTAP security group
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 111
+          ToPort: 111
+          SourceSecurityGroupId: !Ref Ec2SecurityGroup
+        - IpProtocol: udp
+          FromPort: 111
+          ToPort: 111
+          SourceSecurityGroupId: !Ref Ec2SecurityGroup
+        - IpProtocol: tcp
+          FromPort: 635
+          ToPort: 635
+          SourceSecurityGroupId: !Ref Ec2SecurityGroup
+        - IpProtocol: udp
+          FromPort: 635
+          ToPort: 635
+          SourceSecurityGroupId: !Ref Ec2SecurityGroup
+        - IpProtocol: tcp
+          FromPort: 2049
+          ToPort: 2049
+          SourceSecurityGroupId: !Ref Ec2SecurityGroup
+        - IpProtocol: udp
+          FromPort: 2049
+          ToPort: 2049
+          SourceSecurityGroupId: !Ref Ec2SecurityGroup
+        - IpProtocol: tcp
+          FromPort: 4045
+          ToPort: 4046
+          SourceSecurityGroupId: !Ref Ec2SecurityGroup
+        - IpProtocol: udp
+          FromPort: 4045
+          ToPort: 4046
+          SourceSecurityGroupId: !Ref Ec2SecurityGroup
+
+  # S3 Bucket
+  ArchiveBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    Properties:
+      BucketName: !Sub ${ArchiveBucketName}-${AWS::AccountId}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # IAM Role for EC2
+  Ec2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: S3ArcAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                  - s3:GetObjectAttributes
+                  - s3:RestoreObject
+                Resource:
+                  - !GetAtt ArchiveBucket.Arn
+                  - !Sub ${ArchiveBucket.Arn}/*
+              - Effect: Allow
+                Action:
+                  - fsx:DescribeFileSystems
+                  - fsx:ListTagsForResource
+                Resource: '*'
+
+  Ec2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref Ec2Role
+
+  # FSx for NetApp ONTAP
+  FsxFileSystem:
+    Type: AWS::FSx::FileSystem
+    Properties:
+      FileSystemType: ONTAP
+      StorageCapacity: !Ref FsxStorageCapacity
+      SubnetIds:
+        - !Ref PrivateSubnet1
+      SecurityGroupIds:
+        - !Ref FsxSecurityGroup
+      OntapConfiguration:
+        DeploymentType: SINGLE_AZ_1
+        ThroughputCapacity: !Ref FsxThroughput
+        PreferredSubnetId: !Ref PrivateSubnet1
+      Tags:
+        - Key: Name
+          Value: s3arc-test-fsx
+        - Key: ArchiveBucket
+          Value: !Sub ${ArchiveBucketName}-${AWS::AccountId}
+
+  FsxSvm:
+    Type: AWS::FSx::StorageVirtualMachine
+    Properties:
+      FileSystemId: !Ref FsxFileSystem
+      Name: svm1
+      RootVolumeSecurityStyle: UNIX
+
+  FsxVolume:
+    Type: AWS::FSx::Volume
+    Properties:
+      Name: vol1
+      VolumeType: ONTAP
+      OntapConfiguration:
+        JunctionPath: /vol1
+        SizeInMegabytes: 102400
+        StorageVirtualMachineId: !Ref FsxSvm
+        StorageEfficiencyEnabled: true
+        SecurityStyle: UNIX
+        TieringPolicy:
+          CoolingPeriod: 31
+          Name: AUTO
+
+  # EC2 Instance
+  Ec2Instance:
+    Type: AWS::EC2::Instance
+    DependsOn: FsxVolume
+    Properties:
+      ImageId: ami-09e973f123c32cf86
+      InstanceType: !Ref Ec2InstanceType
+      KeyName: !Ref KeyPairName
+      IamInstanceProfile: !Ref Ec2InstanceProfile
+      SubnetId: !Ref PublicSubnet
+      SecurityGroupIds:
+        - !Ref Ec2SecurityGroup
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeSize: 100
+            VolumeType: gp3
+      Tags:
+        - Key: Name
+          Value: s3arc-test-client
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -ex
+          
+          # Install NFS client, AWS CLI, and Python dependencies
+          dnf install -y nfs-utils python3 python3-pip git awscli
+          pip3 install boto3 xattr
+          
+          # Create mount point
+          mkdir -p /mnt/fsx
+          
+          # Wait for SVM to be ready (poll until available)
+          SVM_DNS=""
+          for i in {1..60}; do
+            SVM_DNS=$(aws fsx describe-storage-virtual-machines \
+              --filters Name=file-system-id,Values=${FsxFileSystem} \
+              --query 'StorageVirtualMachines[0].Endpoints.Nfs.DNSName' \
+              --output text --region us-east-1 2>/dev/null || true)
+            if [ -n "$SVM_DNS" ] && [ "$SVM_DNS" != "None" ]; then
+              break
+            fi
+            sleep 30
+          done
+          
+          # Mount FSx volume with retry
+          echo "$SVM_DNS:/vol1 /mnt/fsx nfs4 defaults,_netdev 0 0" >> /etc/fstab
+          for i in {1..10}; do
+            mount /mnt/fsx && break
+            sleep 30
+          done
+          
+          # Create s3arc directory
+          cd /home/ec2-user
+          mkdir -p s3arc
+          
+          echo "Setup complete. FSx mounted at /mnt/fsx"
+
+Outputs:
+  BucketName:
+    Description: S3 archive bucket name
+    Value: !Sub ${ArchiveBucketName}-${AWS::AccountId}
+
+  FsxFileSystemId:
+    Description: FSx filesystem ID
+    Value: !Ref FsxFileSystem
+
+  FsxSvmId:
+    Description: FSx SVM ID
+    Value: !Ref FsxSvm
+
+  Ec2PublicIp:
+    Description: EC2 instance public IP
+    Value: !GetAtt Ec2Instance.PublicIp
+
+  Ec2InstanceId:
+    Description: EC2 instance ID
+    Value: !Ref Ec2Instance
+
+  SshCommand:
+    Description: SSH command to connect
+    Value: !Sub ssh -i ${KeyPairName}.pem ec2-user@${Ec2Instance.PublicIp}
+
+  MountPath:
+    Description: FSx mount path on EC2
+    Value: /mnt/fsx
