@@ -1,5 +1,5 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: S3Arc Test Environment - FSx ONTAP, EC2 client, S3 archive bucket
+Description: S3Arc Test Environment - FSx ONTAP, FSx Lustre, EC2 client, S3 archive bucket
 
 Parameters:
   ArchiveBucketName:
@@ -19,12 +19,23 @@ Parameters:
   
   Ec2InstanceType:
     Type: String
-    Default: c5n.9xlarge
-    Description: EC2 instance type (c5n.9xlarge = 50Gbps, c5n.18xlarge = 100Gbps)
+    Default: c5n.4xlarge
+    Description: EC2 instance type
   
   KeyPairName:
     Type: AWS::EC2::KeyPair::KeyName
     Description: EC2 key pair for SSH access
+
+  FsxAdminPassword:
+    Type: String
+    NoEcho: true
+    MinLength: 8
+    Description: FSx ONTAP admin password
+
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+    Description: Latest Amazon Linux 2023 AMI (auto-resolved via SSM)
 
 Resources:
   # VPC and Networking
@@ -52,31 +63,14 @@ Resources:
     Properties:
       VpcId: !Ref VPC
       CidrBlock: 10.0.1.0/24
-      AvailabilityZone: !Select [0, !GetAZs us-east-1]
+      AvailabilityZone:
+        Fn::Select:
+          - 0
+          - Fn::GetAZs: !Ref "AWS::Region"
       MapPublicIpOnLaunch: true
       Tags:
         - Key: Name
           Value: s3arc-test-public
-
-  PrivateSubnet1:
-    Type: AWS::EC2::Subnet
-    Properties:
-      VpcId: !Ref VPC
-      CidrBlock: 10.0.10.0/24
-      AvailabilityZone: !Select [0, !GetAZs us-east-1]
-      Tags:
-        - Key: Name
-          Value: s3arc-test-private-1
-
-  PrivateSubnet2:
-    Type: AWS::EC2::Subnet
-    Properties:
-      VpcId: !Ref VPC
-      CidrBlock: 10.0.11.0/24
-      AvailabilityZone: !Select [1, !GetAZs us-east-1]
-      Tags:
-        - Key: Name
-          Value: s3arc-test-private-2
 
   PublicRouteTable:
     Type: AWS::EC2::RouteTable
@@ -104,6 +98,8 @@ Resources:
       GroupDescription: EC2 client security group
       VpcId: !Ref VPC
       SecurityGroupIngress:
+        # ⚠️  WARNING: SSH open to 0.0.0.0/0 — FOR TESTING ONLY
+        # Replace with your IP (e.g., 203.0.113.5/32) for production use
         - IpProtocol: tcp
           FromPort: 22
           ToPort: 22
@@ -115,7 +111,7 @@ Resources:
   FsxSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: FSx ONTAP security group
+      GroupDescription: FSx ONTAP and Lustre security group
       VpcId: !Ref VPC
       SecurityGroupIngress:
         - IpProtocol: tcp
@@ -135,6 +131,14 @@ Resources:
           ToPort: 635
           SourceSecurityGroupId: !Ref Ec2SecurityGroup
         - IpProtocol: tcp
+          FromPort: 988
+          ToPort: 988
+          SourceSecurityGroupId: !Ref Ec2SecurityGroup
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref Ec2SecurityGroup
+        - IpProtocol: tcp
           FromPort: 2049
           ToPort: 2049
           SourceSecurityGroupId: !Ref Ec2SecurityGroup
@@ -151,9 +155,20 @@ Resources:
           ToPort: 4046
           SourceSecurityGroupId: !Ref Ec2SecurityGroup
 
+  # Self-referencing rule required by FSx Lustre
+  FsxSecurityGroupSelfIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref FsxSecurityGroup
+      IpProtocol: tcp
+      FromPort: 988
+      ToPort: 988
+      SourceSecurityGroupId: !Ref FsxSecurityGroup
+
   # S3 Bucket
   ArchiveBucket:
     Type: AWS::S3::Bucket
+    DependsOn: RestoreNotificationTopicPolicy
     DeletionPolicy: Delete
     Properties:
       BucketName: !Sub ${ArchiveBucketName}-${AWS::AccountId}
@@ -162,6 +177,110 @@ Resources:
         BlockPublicPolicy: true
         IgnorePublicAcls: true
         RestrictPublicBuckets: true
+      NotificationConfiguration:
+        TopicConfigurations:
+          - Event: s3:ObjectRestore:Completed
+            Topic: !Ref RestoreNotificationTopic
+
+  # Lambda to empty S3 bucket on stack deletion
+  EmptyBucketLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: EmptyBucket
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                  - s3:ListBucketVersions
+                  - s3:DeleteObject
+                  - s3:DeleteObjectVersion
+                Resource:
+                  - !GetAtt ArchiveBucket.Arn
+                  - !Sub ${ArchiveBucket.Arn}/*
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: arn:aws:logs:*:*:*
+
+  EmptyBucketLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 300
+      Role: !GetAtt EmptyBucketLambdaRole.Arn
+      Code:
+        ZipFile: |
+          import boto3, json
+          from urllib.request import Request, urlopen
+          def send(event, context, status):
+            body = json.dumps({
+              'Status': status,
+              'Reason': 'See CloudWatch',
+              'PhysicalResourceId': event.get('PhysicalResourceId', context.log_stream_name),
+              'StackId': event['StackId'],
+              'RequestId': event['RequestId'],
+              'LogicalResourceId': event['LogicalResourceId'],
+              'Data': {}
+            }).encode()
+            urlopen(Request(event['ResponseURL'], data=body, headers={'Content-Type': ''}, method='PUT'))
+          def handler(event, context):
+            try:
+              if event['RequestType'] == 'Delete':
+                bucket = event['ResourceProperties']['Bucket']
+                s3 = boto3.resource('s3')
+                b = s3.Bucket(bucket)
+                b.object_versions.all().delete()
+                b.objects.all().delete()
+            except Exception:
+              pass
+            send(event, context, 'SUCCESS')
+
+  EmptyBucketOnDelete:
+    Type: Custom::EmptyBucket
+    DependsOn: Ec2Instance
+    Properties:
+      ServiceToken: !GetAtt EmptyBucketLambda.Arn
+      Bucket: !Ref ArchiveBucket
+
+  # SNS Topic for restore notifications
+  RestoreNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub ${AWS::StackName}-restore-notifications
+      DisplayName: S3Arc Glacier Restore Notifications
+
+  # SNS Topic Policy to allow S3 to publish
+  RestoreNotificationTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref RestoreNotificationTopic
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: s3.amazonaws.com
+            Action: SNS:Publish
+            Resource: !Ref RestoreNotificationTopic
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+              ArnLike:
+                aws:SourceArn: !Sub arn:aws:s3:::${ArchiveBucketName}-${AWS::AccountId}
 
   # IAM Role for EC2
   Ec2Role:
@@ -196,7 +315,12 @@ Resources:
                 Action:
                   - fsx:DescribeFileSystems
                   - fsx:ListTagsForResource
+                  - fsx:DescribeStorageVirtualMachines
                 Resource: '*'
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref RestoreNotificationTopic
 
   Ec2InstanceProfile:
     Type: AWS::IAM::InstanceProfile
@@ -211,18 +335,27 @@ Resources:
       FileSystemType: ONTAP
       StorageCapacity: !Ref FsxStorageCapacity
       SubnetIds:
-        - !Ref PrivateSubnet1
+        - !Ref PublicSubnet
       SecurityGroupIds:
         - !Ref FsxSecurityGroup
       OntapConfiguration:
         DeploymentType: SINGLE_AZ_1
         ThroughputCapacity: !Ref FsxThroughput
-        PreferredSubnetId: !Ref PrivateSubnet1
+        PreferredSubnetId: !Ref PublicSubnet
+        FsxAdminPassword: !Ref FsxAdminPassword
       Tags:
         - Key: Name
           Value: s3arc-test-fsx
         - Key: ArchiveBucket
           Value: !Sub ${ArchiveBucketName}-${AWS::AccountId}
+        - Key: StorageClass
+          Value: GLACIER_IR
+        - Key: SnsTopicArn
+          Value: !Ref RestoreNotificationTopic
+        - Key: RestoreDays
+          Value: "7"
+        - Key: RestoreTier
+          Value: Standard
 
   FsxSvm:
     Type: AWS::FSx::StorageVirtualMachine
@@ -246,12 +379,42 @@ Resources:
           CoolingPeriod: 31
           Name: AUTO
 
+  # FSx for Lustre (Persistent_2, smallest size)
+  FsxLustreFileSystem:
+    Type: AWS::FSx::FileSystem
+    Properties:
+      FileSystemType: LUSTRE
+      StorageCapacity: 1200
+      SubnetIds:
+        - !Ref PublicSubnet
+      SecurityGroupIds:
+        - !Ref FsxSecurityGroup
+      LustreConfiguration:
+        DeploymentType: PERSISTENT_2
+        PerUnitStorageThroughput: 125
+        DataCompressionType: LZ4
+      Tags:
+        - Key: Name
+          Value: s3arc-test-lustre
+        - Key: ArchiveBucket
+          Value: !Sub ${ArchiveBucketName}-${AWS::AccountId}
+        - Key: StorageClass
+          Value: GLACIER_IR
+        - Key: SnsTopicArn
+          Value: !Ref RestoreNotificationTopic
+        - Key: RestoreDays
+          Value: "7"
+        - Key: RestoreTier
+          Value: Standard
+
   # EC2 Instance
   Ec2Instance:
     Type: AWS::EC2::Instance
-    DependsOn: FsxVolume
+    DependsOn: 
+      - FsxVolume
+      - FsxLustreFileSystem
     Properties:
-      ImageId: ami-09e973f123c32cf86
+      ImageId: !Ref LatestAmiId
       InstanceType: !Ref Ec2InstanceType
       KeyName: !Ref KeyPairName
       IamInstanceProfile: !Ref Ec2InstanceProfile
@@ -259,7 +422,7 @@ Resources:
       SecurityGroupIds:
         - !Ref Ec2SecurityGroup
       BlockDeviceMappings:
-        - DeviceName: /dev/sda1
+        - DeviceName: /dev/xvda
           Ebs:
             VolumeSize: 100
             VolumeType: gp3
@@ -271,38 +434,57 @@ Resources:
           #!/bin/bash
           set -ex
           
-          # Install NFS client, AWS CLI, and Python dependencies
-          dnf install -y nfs-utils python3 python3-pip git awscli
-          pip3 install boto3 xattr
+          # Install NFS client, Lustre client, and Python dependencies
+          dnf install -y nfs-utils python3 python3-pip git lustre-client
           
-          # Create mount point
-          mkdir -p /mnt/fsx
+          pip3 install boto3
           
-          # Wait for SVM to be ready (poll until available)
+          # Create mount points
+          mkdir -p /mnt/fsx /mnt/lustre
+          
+          # Wait for ONTAP SVM to be ready (poll until available)
           SVM_DNS=""
           for i in {1..60}; do
             SVM_DNS=$(aws fsx describe-storage-virtual-machines \
               --filters Name=file-system-id,Values=${FsxFileSystem} \
               --query 'StorageVirtualMachines[0].Endpoints.Nfs.DNSName' \
-              --output text --region us-east-1 2>/dev/null || true)
+              --output text --region ${AWS::Region} 2>/dev/null || true)
             if [ -n "$SVM_DNS" ] && [ "$SVM_DNS" != "None" ]; then
               break
             fi
             sleep 30
           done
           
-          # Mount FSx volume with retry
+          # Get Lustre mount name
+          LUSTRE_DNS=$(aws fsx describe-file-systems \
+            --file-system-ids ${FsxLustreFileSystem} \
+            --query 'FileSystems[0].DNSName' \
+            --output text --region ${AWS::Region})
+          LUSTRE_MOUNT=$(aws fsx describe-file-systems \
+            --file-system-ids ${FsxLustreFileSystem} \
+            --query 'FileSystems[0].LustreConfiguration.MountName' \
+            --output text --region ${AWS::Region})
+          
+          # Mount FSx ONTAP volume with retry
           echo "$SVM_DNS:/vol1 /mnt/fsx nfs4 defaults,_netdev 0 0" >> /etc/fstab
           for i in {1..10}; do
             mount /mnt/fsx && break
             sleep 30
           done
           
+          # Mount FSx Lustre with retry
+          echo "$LUSTRE_DNS@tcp:/$LUSTRE_MOUNT /mnt/lustre lustre defaults,noatime,flock,_netdev 0 0" >> /etc/fstab
+          for i in {1..10}; do
+            mount /mnt/lustre && break
+            sleep 30
+          done
+          
           # Create s3arc directory
           cd /home/ec2-user
           mkdir -p s3arc
+          chown ec2-user:ec2-user s3arc
           
-          echo "Setup complete. FSx mounted at /mnt/fsx"
+          echo "Setup complete. FSx ONTAP mounted at /mnt/fsx, FSx Lustre mounted at /mnt/lustre"
 
 Outputs:
   BucketName:
@@ -310,12 +492,16 @@ Outputs:
     Value: !Sub ${ArchiveBucketName}-${AWS::AccountId}
 
   FsxFileSystemId:
-    Description: FSx filesystem ID
+    Description: FSx ONTAP filesystem ID
     Value: !Ref FsxFileSystem
 
   FsxSvmId:
-    Description: FSx SVM ID
+    Description: FSx ONTAP SVM ID
     Value: !Ref FsxSvm
+
+  FsxLustreFileSystemId:
+    Description: FSx Lustre filesystem ID
+    Value: !Ref FsxLustreFileSystem
 
   Ec2PublicIp:
     Description: EC2 instance public IP
@@ -325,10 +511,22 @@ Outputs:
     Description: EC2 instance ID
     Value: !Ref Ec2Instance
 
+  RestoreNotificationTopicArn:
+    Description: SNS topic ARN for Glacier restore notifications
+    Value: !Ref RestoreNotificationTopic
+
   SshCommand:
     Description: SSH command to connect
     Value: !Sub ssh -i ${KeyPairName}.pem ec2-user@${Ec2Instance.PublicIp}
 
-  MountPath:
-    Description: FSx mount path on EC2
+  SubscribeToNotifications:
+    Description: Command to subscribe your email to restore notifications
+    Value: !Sub aws sns subscribe --topic-arn ${RestoreNotificationTopic} --protocol email --notification-endpoint YOUR-EMAIL@example.com
+
+  MountPathOntap:
+    Description: FSx ONTAP mount path on EC2
     Value: /mnt/fsx
+
+  MountPathLustre:
+    Description: FSx Lustre mount path on EC2
+    Value: /mnt/lustre

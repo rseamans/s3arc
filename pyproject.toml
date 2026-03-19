@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "s3arc"
+version = "0.9"
+description = "Archive files from Amazon FSx to S3 Glacier storage classes"
+readme = "README.md"
+license = "MIT-0"
+requires-python = ">=3.9"
+dependencies = ["boto3>=1.26"]
+
+[project.scripts]
+s3archive = "s3archive:main"
+s3recall = "s3recall:main"
+ls-s3arc = "ls-s3arc:main"

@@ -1,36 +1,18 @@
 #!/usr/bin/env python3
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
 """ls-s3arc: List .s3arc stub files with metadata, S3 location, and optional restore status."""
 
+import argparse
 import os
 import sys
 import json
 import boto3
-import xattr
 from botocore.exceptions import BotoCoreError, ClientError
 
-XATTR_S3KEY = "user.stub.s3key"
-XATTR_BUCKET = "user.stub.bucket"
-XATTR_TYPE = "user.stub.type"
-XATTR_MANIFEST = "user.stub.manifest"
-XATTR_CHECKSUM = "user.stub.checksum"
-XATTR_STORAGE_CLASS = "user.stub.storage_class"
-STUB_EXT = ".s3arc"
-DEFAULT_BUCKET = os.environ.get("S3ARC_BUCKET", "")
+from s3arc_common import STUB_EXT, VERSION, fmt_size, read_stub
 
-
-def get_xattr_str(filepath, attr_name):
-    try:
-        return xattr.getxattr(filepath, attr_name).decode()
-    except OSError:
-        return None
-
-
-def fmt_size(nbytes):
-    for unit in ("B", "KB", "MB", "GB", "TB"):
-        if abs(nbytes) < 1024:
-            return f"{nbytes:.1f} {unit}"
-        nbytes /= 1024
-    return f"{nbytes:.1f} PB"
+DEFAULT_BUCKET = os.environ.get("S3ARC_BUCKET")
 
 
 def get_s3_status(s3_client, bucket, key):
@@ -56,12 +38,12 @@ def get_s3_status(s3_client, bucket, key):
 
 def list_stub(filepath, s3_client=None):
     """Read and return metadata for a single .s3arc stub."""
-    key = get_xattr_str(filepath, XATTR_S3KEY)
-    bucket = get_xattr_str(filepath, XATTR_BUCKET) or DEFAULT_BUCKET
-    stub_type = get_xattr_str(filepath, XATTR_TYPE) or "file"
-    manifest_raw = get_xattr_str(filepath, XATTR_MANIFEST)
-    checksum = get_xattr_str(filepath, XATTR_CHECKSUM)
-    storage_class = get_xattr_str(filepath, XATTR_STORAGE_CLASS)
+    meta = read_stub(filepath)
+    key = meta.get("s3key")
+    bucket = meta.get("bucket") or DEFAULT_BUCKET
+    stub_type = meta.get("type", "file")
+    checksum = meta.get("checksum")
+    storage_class = meta.get("storage_class")
 
     info = {
         "path": filepath,
@@ -77,19 +59,15 @@ def list_stub(filepath, s3_client=None):
     if checksum:
         info["checksum"] = checksum
 
-    # Read file stat for preserved mtime/mode
     try:
         st = os.stat(filepath)
         info["mtime"] = st.st_mtime
         info["mode"] = oct(st.st_mode)
-    except OSError:
-        pass
+    except OSError as e:
+        print(f"Warning: cannot stat {filepath}: {e}", file=sys.stderr)
 
-    if stub_type == "aggregate" and manifest_raw:
-        try:
-            info["manifest"] = json.loads(manifest_raw)
-        except json.JSONDecodeError:
-            info["manifest_raw"] = manifest_raw
+    if stub_type == "aggregate" and "manifest" in meta:
+        info["manifest"] = meta["manifest"]
 
     if s3_client and key:
         info["storage_class"], info["status"] = get_s3_status(s3_client, bucket, key)
@@ -115,43 +93,51 @@ def print_stub(info):
     if info["type"] == "aggregate" and "manifest" in info:
         m = info["manifest"]
         orig = fmt_size(m.get("original_bytes", 0))
-        arc = fmt_size(m.get("archive_bytes", 0))
+        arc = fmt_size(m.get("compressed_bytes", 0))
         ratio = ""
-        if m.get("original_bytes") and m.get("archive_bytes"):
-            ratio = f" ({m['original_bytes'] / m['archive_bytes']:.1f}x)"
-        print(f"    Contents: {m.get('files', '?')} files, {m.get('dirs', '?')} dirs")
+        if m.get("original_bytes") and m.get("compressed_bytes"):
+            ratio = f" ({m['original_bytes'] / m['compressed_bytes']:.1f}x)"
+        print(f"    Contents: {m.get('files', '?')} files")
         print(f"    Size:     {orig} original | {arc} compressed{ratio}")
-        if "archived_at" in m:
-            print(f"    Archived: {m['archived_at']}")
+        if "created" in m:
+            print(f"    Archived: {m['created']}")
+        
+        # Check for local manifest file
+        manifest_path = info['path'].replace('.s3arc', '.manifest')
+        if os.path.exists(manifest_path):
+            try:
+                with open(manifest_path, 'r') as f:
+                    lines = [l for l in f.readlines() if l.strip()]
+                if not lines:
+                    print(f"    Manifest: {os.path.basename(manifest_path)} (empty)")
+                elif not lines[0][0] in '-dlcrwxbps':
+                    print(f"    Manifest: {os.path.basename(manifest_path)} (invalid format)")
+                else:
+                    print(f"    Manifest: {len(lines)} files listed (local file available)")
+                    print(f"              Use: cat {os.path.basename(manifest_path)}")
+            except OSError as e:
+                print(f"    Manifest: {os.path.basename(manifest_path)} (unreadable: {e})")
+        else:
+            print(f"    Manifest: {os.path.basename(manifest_path)} (missing)")
     print()
 
 
 def main():
-    check_status = False
-    json_output = False
-    targets = []
+    parser = argparse.ArgumentParser(
+        prog="ls-s3arc",
+        description="List .s3arc stub files with metadata, S3 location, and optional restore status.",
+        epilog=f"Environment variables:\n  S3ARC_BUCKET  Fallback bucket (default: {DEFAULT_BUCKET})",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("--check-status", action="store_true", help="Query S3 for storage class and restore status")
+    parser.add_argument("--json", dest="json_output", action="store_true", help="Output as JSON")
+    parser.add_argument("--version", action="version", version=f"ls-s3arc {VERSION}")
+    parser.add_argument("paths", nargs="+", metavar="path", help="Files or directories to scan")
+    args = parser.parse_args()
 
-    for arg in sys.argv[1:]:
-        if arg == "--check-status":
-            check_status = True
-        elif arg == "--json":
-            json_output = True
-        elif arg in ("-h", "--help"):
-            print("Usage: ls-s3arc [--check-status] [--json] <path> [path ...]")
-            print()
-            print("Options:")
-            print("  --check-status  Query S3 for storage class and restore status")
-            print("  --json          Output as JSON")
-            print()
-            print("Environment variables:")
-            print(f"  S3ARC_BUCKET  Fallback bucket (default: {DEFAULT_BUCKET})")
-            sys.exit(0)
-        else:
-            targets.append(arg)
-
-    if not targets:
-        print("Usage: ls-s3arc [--check-status] [--json] <path> [path ...]", file=sys.stderr)
-        sys.exit(1)
+    check_status = args.check_status
+    json_output = args.json_output
+    targets = args.paths
 
     s3_client = None
     if check_status:

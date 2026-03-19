@@ -20,3 +20,10 @@ Thumbs.db
 
 # Project specific
 *.s3arc
+
+# Internal/historical docs
+Project-Context.md
+*.docx
+
+# Test artifacts
+.pytest_cache/

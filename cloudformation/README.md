@@ -4,17 +4,21 @@ CloudFormation template to create a test environment for S3Arc.
 
 ## Resources Created
 
-- S3 bucket for archive (tagged on FSx)
+- S3 bucket for archive (tagged on FSx, auto-emptied on stack delete)
 - FSx for NetApp ONTAP (Single-AZ, 1TB, 512 MB/s)
+- FSx for Lustre (Persistent_2, 1.2TB, 125 MB/s)
 - SVM and volume mounted at `/mnt/fsx`
-- EC2 instance (RHEL, c5n.9xlarge with 50Gbps network)
+- Lustre mounted at `/mnt/lustre`
+- EC2 instance (Amazon Linux 2023, c5n.4xlarge with 25Gbps network)
 - VPC, subnets, security groups
-- IAM role with S3 and FSx permissions
+- IAM role with S3, FSx, and SNS permissions
+- SNS topic for restore notifications
+- Lambda function to empty S3 bucket on stack delete
 
 ## Prerequisites
 
-- AWS CLI configured
-- EC2 key pair in us-east-1
+- AWS CLI configured (with default region set via `aws configure`)
+- EC2 key pair in your target region
 
 ## Deploy
 
@@ -22,24 +26,28 @@ CloudFormation template to create a test environment for S3Arc.
 aws cloudformation create-stack \
     --stack-name s3arc-test \
     --template-body file://s3arc-test-stack.yaml \
-    --parameters ParameterKey=KeyPairName,ParameterValue=YOUR_KEY_PAIR \
-    --capabilities CAPABILITY_IAM \
-    --region us-east-1
+    --parameters \
+        ParameterKey=KeyPairName,ParameterValue=YOUR_KEY_PAIR \
+        ParameterKey=FsxAdminPassword,ParameterValue=YOUR_PASSWORD \
+    --capabilities CAPABILITY_IAM
 ```
 
 ## Check Status
 
+The stack takes approximately 30 minutes to complete, primarily waiting for FSx filesystem creation.
+
 ```bash
-aws cloudformation describe-stacks --stack-name s3arc-test --region us-east-1
+aws cloudformation describe-stacks --stack-name s3arc-test \
+    --query 'Stacks[0].StackStatus' --output text
 ```
 
-Wait for `CREATE_COMPLETE` (~30-40 minutes for FSx).
+Wait for `CREATE_COMPLETE` before connecting.
 
 ## Get Outputs
 
 ```bash
 aws cloudformation describe-stacks --stack-name s3arc-test \
-    --query 'Stacks[0].Outputs' --output table --region us-east-1
+    --query 'Stacks[0].Outputs' --output table
 ```
 
 ## Connect to EC2
@@ -61,20 +69,40 @@ python3 /path/to/s3archive.py testfile.txt
 
 ## Delete Stack
 
-**Important:** Empty the S3 bucket first, then delete the stack.
+The stack includes a Lambda function that automatically empties the S3 bucket on delete.
 
 ```bash
-# Empty bucket
-aws s3 rm s3://s3arc-test-archive-ACCOUNT_ID --recursive
-
-# Delete stack
-aws cloudformation delete-stack --stack-name s3arc-test --region us-east-1
+aws cloudformation delete-stack --stack-name s3arc-test
 ```
 
 ## Estimated Costs
 
-- FSx ONTAP 1TB: ~$0.35/hour (~$250/month)
-- EC2 c5n.9xlarge: ~$1.94/hour
-- S3 GIR: ~$0.004/GB/month
+⚠️ The test stack runs ~$1.38/hour (~$33/day). A few days of testing costs roughly $75–150. Delete the stack when done to avoid ongoing charges.
 
-For a few days of testing, expect ~$50-100 total.
+## Future Planned Features
+
+### Vaulting (S3 Object Lock / WORM Protection)
+
+To support immutable archiving, the CloudFormation template will need the following changes:
+
+**Scenario 1: Single bucket with optional per-object retention**
+- Add `ObjectLockEnabled: true` to the `ArchiveBucket` resource (requires bucket recreation)
+- Versioning is automatically enabled with Object Lock
+- No default retention policy on the bucket — retention is applied per-object by `s3archive.py` via `--vault`, `--retain-mode`, `--retain-days` flags
+- Allows plain and vaulted archives in the same bucket
+
+**Scenario 2: Separate vault bucket**
+- Add a second S3 bucket resource with Object Lock enabled and a default `ObjectLockConfiguration` specifying mode and retention period
+- Add a parameter for vault retention mode (`GOVERNANCE` or `COMPLIANCE`) and retention days
+- IAM policy updated to grant `s3:PutObject` on both buckets
+
+**Scenario 3: Legal hold support**
+- No template changes required beyond Object Lock being enabled on the bucket
+- Legal holds are applied per-object at upload time by `s3archive.py` via `--legal-hold`
+- IAM policy must include `s3:PutObjectLegalHold`
+
+**IAM Policy Additions for Vaulting**
+- `s3:PutObjectRetention` — required for setting retention on upload
+- `s3:GetObjectRetention` — required for reading retention status
+- `s3:PutObjectLegalHold` — required for legal hold scenario
+- `s3:BypassGovernanceRetention` — optional, for admin override in Governance mode
