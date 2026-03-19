@@ -479,6 +479,9 @@ Resources:
             sleep 30
           done
           
+          # Set mount permissions so ec2-user can write without sudo
+          chown ec2-user:ec2-user /mnt/fsx /mnt/lustre
+          
           # Create s3arc directory
           cd /home/ec2-user
           mkdir -p s3arc
